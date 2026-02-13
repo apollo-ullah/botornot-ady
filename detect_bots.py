@@ -4,11 +4,12 @@ Bot or Not Challenge — Production Bot Detector
 Senior Researcher Implementation
 
 Architecture:
-  1. Rich feature engineering (50+ features across 5 categories)
+  1. Rich feature engineering (~100 features across 7 categories)
   2. Language-specific models (EN/FR trained separately)
-  3. Multi-model ensemble (LightGBM + XGBoost + Logistic Regression)
+  3. 3-model ensemble (LightGBM + XGBoost + GradientBoosting)
   4. Custom threshold optimization for competition scoring (+4 TP, -1 FN, -2 FP)
   5. Cross-dataset validation for robustness
+  6. Feature ablation-guided selection (removed features that hurt generalization)
 
 Usage:
   Training:   python detect_bots.py --train
@@ -28,12 +29,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import classification_report, confusion_matrix
 import lightgbm as lgb
 import xgboost as xgb
 
@@ -530,13 +527,11 @@ def extract_user_features(user, posts, lang='en'):
     }
 
     # === Interaction features (cross-category signals) ===
+    # Note: hashtag_volume_interaction and cross_user_sim_mean removed —
+    # ablation showed they HURT cross-dataset generalization
     interactions = {
-        # High hashtag diversity + high tweet count = strong bot signal
-        'hashtag_volume_interaction': hashtag_feats['hashtag_per_post'] * user.get('tweet_count', n_posts),
         # High hour entropy + high tweet count = bot posting around the clock
         'entropy_volume_interaction': temporal['hour_entropy'] * user.get('tweet_count', n_posts),
-        # Low URL ratio + high hashtag ratio = bot content pattern
-        'url_hashtag_gap': hashtag_feats['hashtag_per_post'] - agg.get('url_count_mean', 0),
     }
 
     # Combine all features
@@ -681,7 +676,6 @@ class BotDetectorEnsemble:
     def __init__(self, lang='en'):
         self.lang = lang
         self.models = {}
-        self.scaler = StandardScaler()
         self.feature_cols = None
         self.threshold = 0.5
         self.feature_importances = None
@@ -694,9 +688,6 @@ class BotDetectorEnsemble:
 
         # Handle NaN/inf
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Scale features for LR
-        X_scaled = self.scaler.fit_transform(X)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -742,27 +733,7 @@ class BotDetectorEnsemble:
         xgb_model.fit(X, y)
         self.models['xgb'] = xgb_model
 
-        # --- Model 3: Logistic Regression (calibrated) ---
-        lr_model = LogisticRegression(
-            C=0.5, penalty='l2', max_iter=2000, random_state=42,
-            class_weight='balanced', solver='lbfgs',
-        )
-        lr_model.fit(X_scaled, y)
-        self.models['lr'] = lr_model
-
-        # --- Model 4: Random Forest ---
-        rf_model = RandomForestClassifier(
-            n_estimators=500,
-            max_depth=6,
-            min_samples_leaf=5,
-            class_weight='balanced',
-            random_state=42,
-            n_jobs=-1,
-        )
-        rf_model.fit(X, y)
-        self.models['rf'] = rf_model
-
-        # --- Model 5: Gradient Boosting ---
+        # --- Model 3: Gradient Boosting ---
         gb_model = GradientBoostingClassifier(
             n_estimators=500,
             max_depth=3,
@@ -785,8 +756,6 @@ class BotDetectorEnsemble:
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
             X_tr, X_val = X[train_idx], X[val_idx]
             y_tr, y_val = y[train_idx], y[val_idx]
-            X_tr_sc = self.scaler.fit_transform(X_tr)
-            X_val_sc = self.scaler.transform(X_val)
 
             fold_probs = np.zeros(len(val_idx))
 
@@ -799,7 +768,7 @@ class BotDetectorEnsemble:
                 random_state=42, verbose=-1, is_unbalance=True,
             )
             lgb_f.fit(X_tr, y_tr)
-            fold_probs += lgb_f.predict_proba(X_val)[:, 1] * 0.25
+            fold_probs += lgb_f.predict_proba(X_val)[:, 1] * 0.35
 
             # XGBoost fold
             xgb_f = xgb.XGBClassifier(
@@ -811,23 +780,7 @@ class BotDetectorEnsemble:
                 eval_metric='logloss',
             )
             xgb_f.fit(X_tr, y_tr)
-            fold_probs += xgb_f.predict_proba(X_val)[:, 1] * 0.25
-
-            # LR fold
-            lr_f = LogisticRegression(
-                C=0.5, penalty='l2', max_iter=2000, random_state=42,
-                class_weight='balanced', solver='lbfgs',
-            )
-            lr_f.fit(X_tr_sc, y_tr)
-            fold_probs += lr_f.predict_proba(X_val_sc)[:, 1] * 0.10
-
-            # RF fold
-            rf_f = RandomForestClassifier(
-                n_estimators=500, max_depth=6, min_samples_leaf=5,
-                class_weight='balanced', random_state=42, n_jobs=-1,
-            )
-            rf_f.fit(X_tr, y_tr)
-            fold_probs += rf_f.predict_proba(X_val)[:, 1] * 0.20
+            fold_probs += xgb_f.predict_proba(X_val)[:, 1] * 0.35
 
             # GB fold
             gb_f = GradientBoostingClassifier(
@@ -835,7 +788,7 @@ class BotDetectorEnsemble:
                 subsample=0.7, min_samples_leaf=10, random_state=42,
             )
             gb_f.fit(X_tr, y_tr)
-            fold_probs += gb_f.predict_proba(X_val)[:, 1] * 0.20
+            fold_probs += gb_f.predict_proba(X_val)[:, 1] * 0.30
 
             all_probs[val_idx] = fold_probs
 
@@ -856,9 +809,6 @@ class BotDetectorEnsemble:
             print(f"  Score={score} (max possible={SCORE_TP * total_bots})")
             print(f"  Accuracy={100*(tp+tn)/len(y):.1f}%")
 
-        # Re-fit scaler on full data for inference
-        self.scaler.fit(X)
-
         # Feature importance from LightGBM
         self.feature_importances = dict(zip(
             self.feature_cols,
@@ -871,14 +821,11 @@ class BotDetectorEnsemble:
         """Get ensemble probability predictions."""
         X = df[self.feature_cols].values
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        X_scaled = self.scaler.transform(X)
 
         probs = np.zeros(len(X))
-        probs += self.models['lgb'].predict_proba(X)[:, 1] * 0.25
-        probs += self.models['xgb'].predict_proba(X)[:, 1] * 0.25
-        probs += self.models['lr'].predict_proba(X_scaled)[:, 1] * 0.10
-        probs += self.models['rf'].predict_proba(X)[:, 1] * 0.20
-        probs += self.models['gb'].predict_proba(X)[:, 1] * 0.20
+        probs += self.models['lgb'].predict_proba(X)[:, 1] * 0.35
+        probs += self.models['xgb'].predict_proba(X)[:, 1] * 0.35
+        probs += self.models['gb'].predict_proba(X)[:, 1] * 0.30
 
         return probs
 
@@ -993,6 +940,55 @@ def train_pipeline(verbose=True):
 
 
 # ============================================================================
+# HARD RULES (near-zero FP, catches bot pipeline artifacts)
+# ============================================================================
+
+def apply_hard_rules(user, posts):
+    """
+    High-confidence rules that catch bot pipeline artifacts.
+    These fire before the ML model and have near-zero false positive rates.
+    Returns (is_bot, reason) or (False, None).
+    """
+    name = user.get('name', '') or ''
+    location = user.get('location', '') or ''
+    texts = [p['text'] for p in posts]
+
+    # Rule 1: Garbled name — non-printable characters from broken Unicode in bot pipelines
+    if any(ord(c) < 32 for c in name):
+        return True, "garbled_name"
+
+    # Rule 2: LLM output leakage — literal prompt framing leaked into tweet text
+    llm_leak_patterns = [
+        r'here are some of my recent tweets',
+        r'here are the re-?written',
+        r'here are some (?:recent )?rewrites',
+        r'here are some (?:modified|revised|alternative) versions',
+        r'rewritten tweet',
+        r'here are some changes i made',
+        r'as an ai\b',
+        r'as a language model',
+        r'voici (?:quelques|mes) (?:récents? )?tweets',
+        r'voici (?:les|des) versions? (?:révisée|modifiée)',
+    ]
+    for t in texts:
+        t_lower = t.lower()
+        for pat in llm_leak_patterns:
+            if re.search(pat, t_lower):
+                return True, "llm_leak"
+
+    # Rule 3: Systematic URL typos — htts:// instead of https://
+    for t in texts:
+        if 'htts://' in t or 'htt://' in t:
+            return True, "url_typo"
+
+    # Rule 4: Weird location format — pipeline artifacts like :null:, O:location:O
+    if any(marker in location for marker in [':null:', 'O:', '.:']):
+        return True, "weird_location"
+
+    return False, None
+
+
+# ============================================================================
 # INFERENCE PIPELINE
 # ============================================================================
 
@@ -1018,24 +1014,39 @@ def detect_bots(input_path, output_path):
 
     model = models[lang]
 
-    # Extract features
-    df, user_ids = prepare_dataset(data, lang=lang)
+    users = {u['id']: u for u in data['users']}
+    posts_by_author = defaultdict(list)
+    for p in data['posts']:
+        posts_by_author[p['author_id']].append(p)
 
-    # Predict
+    # Phase 1: Hard rules (near-zero FP pipeline artifact detection)
+    hard_rule_bots = set()
+    for uid, user in users.items():
+        user_posts = posts_by_author.get(uid, [])
+        if user_posts:
+            is_bot, reason = apply_hard_rules(user, user_posts)
+            if is_bot:
+                hard_rule_bots.add(uid)
+
+    # Phase 2: ML ensemble
+    df, user_ids = prepare_dataset(data, lang=lang)
     probs = model.predict_proba(df)
     predictions = (probs >= model.threshold).astype(int)
+    ml_bots = set(uid for uid, pred in zip(user_ids, predictions) if pred == 1)
 
-    # Write output
-    bot_ids = [uid for uid, pred in zip(user_ids, predictions) if pred == 1]
+    # Combine: union of hard rules and ML detections
+    all_bots = hard_rule_bots | ml_bots
 
     with open(output_path, 'w') as f:
-        for uid in bot_ids:
+        for uid in all_bots:
             f.write(uid + '\n')
 
-    print(f"Detected {len(bot_ids)} bots out of {len(user_ids)} users")
+    n_hard_only = len(hard_rule_bots - ml_bots)
+    print(f"Detected {len(all_bots)} bots out of {len(users)} users "
+          f"(ML: {len(ml_bots)}, hard rules: {len(hard_rule_bots)}, hard-only: {n_hard_only})")
     print(f"Output written to {output_path}")
 
-    return bot_ids
+    return list(all_bots)
 
 
 # ============================================================================
