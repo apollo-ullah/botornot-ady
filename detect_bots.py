@@ -224,6 +224,8 @@ def compute_text_diversity_features(texts):
         'avg_sentence_completeness': 0, 'punctuation_diversity': 0,
         'char_len_cv': 0, 'tweet_len_uniformity': 0,
         'url_consistency': 0, 'ai_phrase_ratio': 0,
+        'artificial_caps_ratio': 0, 'generic_life_ratio': 0,
+        'short_generic_ratio': 0,
     }
     if not texts:
         return empty_feats
@@ -367,6 +369,40 @@ def compute_text_diversity_features(texts):
     ))
     ai_phrase_ratio = ai_phrases / max(len(texts), 1)
 
+    # Artificial typo injection detection (bots inject random CAPS mid-word)
+    # Pattern: lowercase letters surrounding a random uppercase letter mid-word
+    artificial_caps_tweets = 0
+    for t in texts:
+        # Find words with random mid-word capitalization like "somepeople", "THe", "eblieve"
+        words = t.split()
+        mid_caps = 0
+        for w in words:
+            if len(w) >= 3:
+                # Count mid-word caps switches (e.g., "aM", "THe", "gef")
+                for j in range(1, len(w) - 1):
+                    if w[j].isupper() and (w[j-1].islower() or w[j+1].islower()):
+                        mid_caps += 1
+                        break
+        if mid_caps >= 2:
+            artificial_caps_tweets += 1
+    artificial_caps_ratio = artificial_caps_tweets / max(len(texts), 1)
+
+    # "Generic life post" ratio — tweets about generic daily life observations
+    generic_life = sum(1 for t in texts if re.search(
+        r'(just another day|living (my|her|his) best life|'
+        r'who else (loves|thinks|feels)|can we (talk|appreciate)|'
+        r'(morning|evening) (routine|stroll|walk)|'
+        r'(happy|excited) to (announce|share)|'
+        r'(passionate|proud) (about|of|to)|'
+        r'(empowering|inspiring|motivating)|'
+        r'(sustainability|initiative|innovati))', t, re.I
+    ))
+    generic_life_ratio = generic_life / max(len(texts), 1)
+
+    # Short generic post ratio (very short, bland posts — flower/plant bots)
+    short_generic = sum(1 for t in texts if len(t) < 60 and not re.search(r'http|@|#', t))
+    short_generic_ratio = short_generic / max(len(texts), 1)
+
     return {
         'ttr': ttr,
         'hapax_ratio': hapax_ratio,
@@ -387,6 +423,9 @@ def compute_text_diversity_features(texts):
         'tweet_len_uniformity': tweet_len_uniformity,
         'url_consistency': url_consistency,
         'ai_phrase_ratio': ai_phrase_ratio,
+        'artificial_caps_ratio': artificial_caps_ratio,
+        'generic_life_ratio': generic_life_ratio,
+        'short_generic_ratio': short_generic_ratio,
     }
 
 
@@ -446,6 +485,15 @@ def extract_user_features(user, posts, lang='en'):
             agg[f'{key}_std'] = np.std(vals)
             agg[f'{key}_max'] = np.max(vals)
 
+    # === Temporal features ===
+    temporal = compute_temporal_features(posts)
+
+    # === Text diversity features ===
+    diversity = compute_text_diversity_features(texts)
+
+    # === Hashtag features ===
+    hashtag_feats = compute_hashtag_features(tweet_features)
+
     # === User profile features ===
     desc = user.get('description', '') or ''
     name = user.get('name', '') or ''
@@ -473,16 +521,23 @@ def extract_user_features(user, posts, lang='en'):
         'name_has_special_chars': int(bool(re.search(r'[^\w\s.,!?\'-]', name))),
         'desc_has_newline': int('\n' in desc),
         'desc_pipe_count': desc.count('|'),
+        # Bot-like profile patterns: formulaic "X | Y | Z" structure
+        'desc_formulaic': int(desc.count('|') >= 2),
+        # Username pattern: word_word or word_word123
+        'username_bot_pattern': int(bool(re.match(r'^[a-z]+_[a-z]+\d*$', username))),
+        # Name is "generic" (FirstName LastName pattern)
+        'name_generic_pattern': int(bool(re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+$', name.strip()))),
     }
 
-    # === Temporal features ===
-    temporal = compute_temporal_features(posts)
-
-    # === Text diversity features ===
-    diversity = compute_text_diversity_features(texts)
-
-    # === Hashtag features ===
-    hashtag_feats = compute_hashtag_features(tweet_features)
+    # === Interaction features (cross-category signals) ===
+    interactions = {
+        # High hashtag diversity + high tweet count = strong bot signal
+        'hashtag_volume_interaction': hashtag_feats['hashtag_per_post'] * user.get('tweet_count', n_posts),
+        # High hour entropy + high tweet count = bot posting around the clock
+        'entropy_volume_interaction': temporal['hour_entropy'] * user.get('tweet_count', n_posts),
+        # Low URL ratio + high hashtag ratio = bot content pattern
+        'url_hashtag_gap': hashtag_feats['hashtag_per_post'] - agg.get('url_count_mean', 0),
+    }
 
     # Combine all features
     features = {}
@@ -491,6 +546,7 @@ def extract_user_features(user, posts, lang='en'):
     features.update(temporal)
     features.update(diversity)
     features.update(hashtag_feats)
+    features.update(interactions)
 
     return features
 
@@ -511,6 +567,38 @@ def load_bots(path):
         return set(line.strip() for line in f if line.strip())
 
 
+def compute_cross_user_features(users_dict, posts_by_author, user_order):
+    """Compute cross-user similarity features using TF-IDF."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # Build per-user text corpus
+    user_texts = []
+    for uid in user_order:
+        texts = [p['text'] for p in posts_by_author.get(uid, [])]
+        user_texts.append(' '.join(texts))
+
+    if len(user_texts) < 2:
+        return {uid: {'cross_user_sim_mean': 0, 'cross_user_sim_max': 0} for uid in user_order}
+
+    vectorizer = TfidfVectorizer(max_features=3000, min_df=2, max_df=0.95)
+    try:
+        tfidf_matrix = vectorizer.fit_transform(user_texts)
+        sim_matrix = cosine_similarity(tfidf_matrix)
+    except ValueError:
+        return {uid: {'cross_user_sim_mean': 0, 'cross_user_sim_max': 0} for uid in user_order}
+
+    result = {}
+    for i, uid in enumerate(user_order):
+        sims = sim_matrix[i].copy()
+        sims[i] = 0  # exclude self
+        result[uid] = {
+            'cross_user_sim_mean': float(np.mean(sims)),
+            'cross_user_sim_max': float(np.max(sims)),
+        }
+    return result
+
+
 def prepare_dataset(data, bot_ids=None, lang=None):
     """Convert raw data into feature matrix."""
     if lang is None:
@@ -521,14 +609,21 @@ def prepare_dataset(data, bot_ids=None, lang=None):
     for p in data['posts']:
         posts_by_author[p['author_id']].append(p)
 
+    # Get user order (only users with posts)
+    user_order = [uid for uid in users if uid in posts_by_author]
+
+    # Compute cross-user features
+    cross_user = compute_cross_user_features(users, posts_by_author, user_order)
+
     rows = []
     user_ids = []
 
-    for uid in users:
-        if uid not in posts_by_author:
-            continue
+    for uid in user_order:
         user_posts = posts_by_author[uid]
         features = extract_user_features(users[uid], user_posts, lang)
+
+        # Add cross-user features
+        features.update(cross_user.get(uid, {'cross_user_sim_mean': 0, 'cross_user_sim_max': 0}))
 
         if bot_ids is not None:
             features['label'] = int(uid in bot_ids)
@@ -609,17 +704,18 @@ class BotDetectorEnsemble:
             print(f"Features: {len(self.feature_cols)}")
             print(f"{'='*60}")
 
-        # --- Model 1: LightGBM ---
+        # --- Model 1: LightGBM (strong regularization for generalization) ---
         lgb_model = lgb.LGBMClassifier(
-            n_estimators=500,
-            max_depth=6,
-            learning_rate=0.05,
-            num_leaves=31,
-            min_child_samples=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
+            n_estimators=800,
+            max_depth=4,
+            learning_rate=0.03,
+            num_leaves=15,
+            min_child_samples=10,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=1.0,
+            reg_lambda=5.0,
+            min_split_gain=0.01,
             random_state=42,
             verbose=-1,
             is_unbalance=True,
@@ -629,13 +725,15 @@ class BotDetectorEnsemble:
 
         # --- Model 2: XGBoost ---
         xgb_model = xgb.XGBClassifier(
-            n_estimators=500,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
+            n_estimators=800,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=1.0,
+            reg_lambda=5.0,
+            gamma=0.1,
+            min_child_weight=5,
             random_state=42,
             verbosity=0,
             scale_pos_weight=sum(y == 0) / max(sum(y == 1), 1),
@@ -646,7 +744,7 @@ class BotDetectorEnsemble:
 
         # --- Model 3: Logistic Regression (calibrated) ---
         lr_model = LogisticRegression(
-            C=1.0, penalty='l2', max_iter=1000, random_state=42,
+            C=0.5, penalty='l2', max_iter=2000, random_state=42,
             class_weight='balanced', solver='lbfgs',
         )
         lr_model.fit(X_scaled, y)
@@ -654,9 +752,9 @@ class BotDetectorEnsemble:
 
         # --- Model 4: Random Forest ---
         rf_model = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_leaf=3,
+            n_estimators=500,
+            max_depth=6,
+            min_samples_leaf=5,
             class_weight='balanced',
             random_state=42,
             n_jobs=-1,
@@ -666,10 +764,11 @@ class BotDetectorEnsemble:
 
         # --- Model 5: Gradient Boosting ---
         gb_model = GradientBoostingClassifier(
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
+            n_estimators=500,
+            max_depth=3,
+            learning_rate=0.03,
+            subsample=0.7,
+            min_samples_leaf=10,
             random_state=42,
         )
         gb_model.fit(X, y)
@@ -693,28 +792,30 @@ class BotDetectorEnsemble:
 
             # LightGBM fold
             lgb_f = lgb.LGBMClassifier(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                num_leaves=31, min_child_samples=5, subsample=0.8,
-                colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=800, max_depth=4, learning_rate=0.03,
+                num_leaves=15, min_child_samples=10, subsample=0.7,
+                colsample_bytree=0.7, reg_alpha=1.0, reg_lambda=5.0,
+                min_split_gain=0.01,
                 random_state=42, verbose=-1, is_unbalance=True,
             )
             lgb_f.fit(X_tr, y_tr)
-            fold_probs += lgb_f.predict_proba(X_val)[:, 1] * 0.30
+            fold_probs += lgb_f.predict_proba(X_val)[:, 1] * 0.25
 
             # XGBoost fold
             xgb_f = xgb.XGBClassifier(
-                n_estimators=500, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1,
-                reg_lambda=1.0, random_state=42, verbosity=0,
+                n_estimators=800, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, reg_alpha=1.0,
+                reg_lambda=5.0, gamma=0.1, min_child_weight=5,
+                random_state=42, verbosity=0,
                 scale_pos_weight=sum(y_tr == 0) / max(sum(y_tr == 1), 1),
                 eval_metric='logloss',
             )
             xgb_f.fit(X_tr, y_tr)
-            fold_probs += xgb_f.predict_proba(X_val)[:, 1] * 0.30
+            fold_probs += xgb_f.predict_proba(X_val)[:, 1] * 0.25
 
             # LR fold
             lr_f = LogisticRegression(
-                C=1.0, penalty='l2', max_iter=1000, random_state=42,
+                C=0.5, penalty='l2', max_iter=2000, random_state=42,
                 class_weight='balanced', solver='lbfgs',
             )
             lr_f.fit(X_tr_sc, y_tr)
@@ -722,19 +823,19 @@ class BotDetectorEnsemble:
 
             # RF fold
             rf_f = RandomForestClassifier(
-                n_estimators=300, max_depth=8, min_samples_leaf=3,
+                n_estimators=500, max_depth=6, min_samples_leaf=5,
                 class_weight='balanced', random_state=42, n_jobs=-1,
             )
             rf_f.fit(X_tr, y_tr)
-            fold_probs += rf_f.predict_proba(X_val)[:, 1] * 0.15
+            fold_probs += rf_f.predict_proba(X_val)[:, 1] * 0.20
 
             # GB fold
             gb_f = GradientBoostingClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.8, random_state=42,
+                n_estimators=500, max_depth=3, learning_rate=0.03,
+                subsample=0.7, min_samples_leaf=10, random_state=42,
             )
             gb_f.fit(X_tr, y_tr)
-            fold_probs += gb_f.predict_proba(X_val)[:, 1] * 0.15
+            fold_probs += gb_f.predict_proba(X_val)[:, 1] * 0.20
 
             all_probs[val_idx] = fold_probs
 
@@ -773,11 +874,11 @@ class BotDetectorEnsemble:
         X_scaled = self.scaler.transform(X)
 
         probs = np.zeros(len(X))
-        probs += self.models['lgb'].predict_proba(X)[:, 1] * 0.30
-        probs += self.models['xgb'].predict_proba(X)[:, 1] * 0.30
+        probs += self.models['lgb'].predict_proba(X)[:, 1] * 0.25
+        probs += self.models['xgb'].predict_proba(X)[:, 1] * 0.25
         probs += self.models['lr'].predict_proba(X_scaled)[:, 1] * 0.10
-        probs += self.models['rf'].predict_proba(X)[:, 1] * 0.15
-        probs += self.models['gb'].predict_proba(X)[:, 1] * 0.15
+        probs += self.models['rf'].predict_proba(X)[:, 1] * 0.20
+        probs += self.models['gb'].predict_proba(X)[:, 1] * 0.20
 
         return probs
 
