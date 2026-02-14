@@ -22,24 +22,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`detect_bots.py` implements a 5-model ensemble with 108 features:
+`detect_bots.py` implements a two-phase pipeline: hard rules (near-zero FP heuristics) → 3-model ML ensemble.
 
-1. **Feature categories (108 features):** profile metadata, aggregated text stats, temporal patterns, text diversity/stylometry, hashtag analysis, cross-user TF-IDF similarity, AI-text detection markers, interaction features
-2. **5-model ensemble:** LightGBM (25%) + XGBoost (25%) + GradientBoosting (20%) + RandomForest (20%) + LogisticRegression (10%)
-3. **Language-specific models** — separate EN/FR trained on respective dataset pairs
-4. **Cross-validated threshold optimization** — 5-fold stratified CV maximizing the custom score
+1. **Hard rules** fire first: garbled names (non-printable chars), LLM output leakage ("here are my recent tweets"), systematic URL typos (`htts://`), weird location formats
+2. **Feature engineering** (~100 features): profile metadata, aggregated text stats, temporal patterns, text diversity/stylometry, hashtag analysis, cross-user TF-IDF similarity, AI-text detection markers, interaction features
+3. **3-model ensemble:** LightGBM (35%) + XGBoost (35%) + GradientBoosting (30%)
+4. **Language-specific models** — separate EN/FR trained on respective dataset pairs
+5. **Cross-validated threshold optimization** — 5-fold stratified CV maximizing the custom score
+6. Final detections = union of hard rule hits + ML predictions above threshold
+
+### Key internal structure (`detect_bots.py`)
+- `extract_text_features()` → per-tweet text signals
+- `compute_temporal_features()` → posting pattern analysis
+- `compute_text_diversity_features()` → stylometry across a user's posts
+- `compute_hashtag_features()` → hashtag usage patterns
+- `extract_user_features()` → orchestrates all per-user feature extraction
+- `compute_cross_user_features()` → TF-IDF similarity between users
+- `prepare_dataset()` → full pipeline: loads data → extracts features → returns DataFrame
+- `BotDetectorEnsemble` class → trains models, optimizes threshold, predicts
+- `apply_hard_rules()` → pre-ML heuristic bot detection
+- `detect_bots()` → inference entry point (loads model, applies hard rules + ML)
 
 ## Commands
 
 ```bash
 # Train models on all practice datasets
-python detect_bots.py --train
+python detect_bots.py --train          # → saves models.pkl
 
 # Run inference on new data
 python detect_bots.py <input.json> <output.txt>
 
 # EDA (stdlib only)
 python eda_analysis.py
+
+# Feature analysis
+python feature_ablation.py     # Cross-dataset ablation study
+python feature_selection.py    # Feature subset evaluation
+python feature_selection_fast.py  # Faster variant
 ```
 
 ## Dependencies
@@ -69,7 +88,7 @@ python eda_analysis.py
 
 ## Key Files
 
-- `detect_bots.py` — Production detector (train + inference)
-- `models.pkl` — Trained model artifacts
+- `detect_bots.py` — Production detector (train + inference), saves `models.pkl`
 - `eda_analysis.py` — Exploratory data analysis
-- `BOT_DETECTION_PLAN.md` — Original plan (from competitor)
+- `feature_ablation.py` — Cross-dataset feature ablation study (imports from `detect_bots`)
+- `BOT_DETECTION_PLAN.md` — Original detection plan

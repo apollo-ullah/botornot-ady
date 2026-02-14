@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 Bot or Not Challenge — Production Bot Detector
-Senior Researcher Implementation
 
 Architecture:
-  1. Rich feature engineering (~100 features across 7 categories)
-  2. Language-specific models (EN/FR trained separately)
-  3. 3-model ensemble (LightGBM + XGBoost + GradientBoosting)
-  4. Custom threshold optimization for competition scoring (+4 TP, -1 FN, -2 FP)
-  5. Cross-dataset validation for robustness
-  6. Feature ablation-guided selection (removed features that hurt generalization)
+  1. Hard rules (near-zero FP heuristics for pipeline artifacts) → fire before ML
+  2. Rich feature engineering (~100 features across 7 categories)
+  3. Language-specific models (EN/FR trained separately)
+  4. 3-model ensemble (LightGBM + XGBoost + GradientBoosting)
+  5. Custom threshold optimization for competition scoring (+4 TP, -1 FN, -2 FP)
+  6. Cross-dataset validation for robustness
+  7. Feature ablation-guided selection (removed features that hurt generalization)
 
 Usage:
   Training:   python detect_bots.py --train
@@ -857,8 +857,8 @@ def train_pipeline(verbose=True):
     # Load all datasets
     datasets = {}
     for ds_id in [30, 31, 32, 33]:
-        data_path = base_dir / f'dataset.posts&users.{ds_id}.json'
-        bots_path = base_dir / f'dataset.bots.{ds_id}.txt'
+        data_path = base_dir / 'datasets' / f'dataset.posts&users.{ds_id}.json'
+        bots_path = base_dir / 'datasets' / f'dataset.bots.{ds_id}.txt'
         if data_path.exists() and bots_path.exists():
             datasets[ds_id] = {
                 'data': load_dataset(data_path),
