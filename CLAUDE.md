@@ -51,14 +51,6 @@ python detect_bots.py --train          # → saves models.pkl
 
 # Run inference on new data
 python detect_bots.py <input.json> <output.txt>
-
-# EDA (stdlib only)
-python eda_analysis.py
-
-# Feature analysis
-python feature_ablation.py     # Cross-dataset ablation study
-python feature_selection.py    # Feature subset evaluation
-python feature_selection_fast.py  # Faster variant
 ```
 
 ## Dependencies
@@ -89,6 +81,5 @@ python feature_selection_fast.py  # Faster variant
 ## Key Files
 
 - `detect_bots.py` — Production detector (train + inference), saves `models.pkl`
-- `eda_analysis.py` — Exploratory data analysis
-- `feature_ablation.py` — Cross-dataset feature ablation study (imports from `detect_bots`)
-- `BOT_DETECTION_PLAN.md` — Original detection plan
+- `models.pkl` — Trained model artifacts
+- `datasets/` — Practice datasets (30-33) and eval datasets (34-35)
